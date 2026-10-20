@@ -60,6 +60,8 @@ REQUIRED_PROPERTIES = {
     "AccountingRegister": {"ChartOfAccounts"},
     "CalculationRegister": {"ChartOfCalculationTypes", "Schedule", "ScheduleValue", "ScheduleDate"},
     "ChartOfAccounts": {"ExtDimensionTypes"}, "CommonCommand": {"Group"},
+    "CommonAttribute": {"DataSeparationValue", "DataSeparationUse"},  # a separator names its session parameters
+    "EventSubscription": {"Handler", "Source"}, "ScheduledJob": {"MethodName"},
 }
 REQUIRED_LISTS = {"DocumentJournal": {"RegisteredDocuments"}}
 REQUIRED_CHILDREN = {
@@ -74,12 +76,48 @@ QUERY_KINDS = {
     "ПланВидовХарактеристик": "ChartOfCharacteristicTypes", "ПланСчетов": "ChartOfAccounts",
     "ПланВидовРасчета": "ChartOfCalculationTypes", "ПланОбмена": "ExchangePlan",
     "БизнесПроцесс": "BusinessProcess", "Задача": "Task", "ЖурналДокументов": "DocumentJournal",
-    "Константа": "Constant", "Последовательность": "Sequence",
+    "Константа": "Constant", "Последовательность": "Sequence", "КритерийОтбора": "FilterCriterion",
 }
 VIRTUAL_TABLES = {"СрезПоследних", "СрезПервых", "Остатки", "Обороты", "ОстаткиИОбороты",
                   "ДвиженияССубконто", "ОборотыДтКт", "Субконто", "ДанныеГрафика", "Изменения", "SliceLast", "SliceFirst", "Balance",
                   "Turnovers", "BalanceAndTurnovers", "RecordsWithExtDimensions", "DrCrTurnovers", "ExtDimensions", "ScheduleData", "Changes"}
 AS_WORDS = {"КАК", "как", "Как", "AS", "as", "As"}
+REF_WORDS = {"Ссылка", "Ref"}
+PREDEFINED = "@predefined"  # a query path to a predefined item: [PREDEFINED, name]
+SPACE = " \t\r\n\x0b\x0c"  # the white space of a query, ASCII only as in the C++ builder
+OPEN_PROPERTIES = ("DefaultForm", "MainDataCompositionSchema")  # what StandardCommand.Open of a stub needs
+CONSTANTS_SET = "@constants"
+ALL_FIELDS = "@all"  # a query path Источник.*: every field of the object  # the type of a form attribute НаборКонстант: its fields are constants
+# A resource of a virtual table of a register (КоличествоОстаток, СуммаОборотДт): the suffix
+# goes, longest first, then Дт/Кт of an accounting dimension (СчетДт, Субконто1Кт is no member).
+RESOURCE_SUFFIXES = sorted((
+    "НачальныйРазвернутыйОстаток", "КонечныйРазвернутыйОстаток", "НачальныйОстаток", "КонечныйОстаток",
+    "Остаток", "Оборот", "Приход", "Расход", "ВстречныйОборот",
+    "OpeningSplittedBalance", "ClosingSplittedBalance", "OpeningBalance", "ClosingBalance",
+    "Balance", "Turnover", "Receipt", "Expense", "CorrTurnover"), key=len, reverse=True)
+SIDE_SUFFIXES = ("Дт", "Кт", "Dr", "Cr")
+REGISTER_KINDS = ("AccumulationRegister", "AccountingRegister", "CalculationRegister", "InformationRegister")
+
+
+def fold(s):
+    """The query language ignores case: ASCII and Cyrillic letters folded, the rest kept,
+    the same as the C++ builder."""
+    return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" or "А" <= c <= "Я" else "ё" if c == "Ё" else c for c in s)
+
+
+QUERY_KINDS_FOLDED = {fold(k): v for k, v in QUERY_KINDS.items()}
+QUERY_KINDS_FOLDED.update({fold(k): k for k in TYPE_FOLDERS if k != "Language"})
+# Words of the query language that never name a field or an alias.
+QUERY_KEYWORDS = {fold(w) for w in (
+    "ВЫБРАТЬ ИЗ ГДЕ ЛЕВОЕ ПРАВОЕ ВНУТРЕННЕЕ ПОЛНОЕ ВНЕШНЕЕ СОЕДИНЕНИЕ ПО СГРУППИРОВАТЬ УПОРЯДОЧИТЬ ОБЪЕДИНИТЬ ВСЕ "
+    "ИМЕЮЩИЕ ИТОГИ ДЛЯ ИЗМЕНЕНИЯ ИНДЕКСИРОВАТЬ ВЫБОР КОГДА ТОГДА ИНАЧЕ КОНЕЦ И ИЛИ НЕ В ЕСТЬ NULL КАК РАЗРЕШЕННЫЕ "
+    "РАЗЛИЧНЫЕ ПЕРВЫЕ ИЕРАРХИИ ССЫЛКА МЕЖДУ ПОДОБНО СПЕЦСИМВОЛ ПОМЕСТИТЬ УНИЧТОЖИТЬ АВТОУПОРЯДОЧИВАНИЕ ВОЗР УБЫВ ОБЩИЕ "
+    "ТОЛЬКО ПЕРИОДАМИ ИСТИНА ЛОЖЬ НЕОПРЕДЕЛЕНО ЗНАЧЕНИЕ ВЫРАЗИТЬ ТИП ТИПЗНАЧЕНИЯ ЕСТЬNULL ПРЕДСТАВЛЕНИЕ "
+    "ПРЕДСТАВЛЕНИЕССЫЛКИ КОЛИЧЕСТВО СУММА МАКСИМУМ МИНИМУМ СРЕДНЕЕ ПОДСТРОКА "
+    "SELECT FROM WHERE LEFT RIGHT INNER FULL OUTER JOIN ON GROUP BY ORDER UNION ALL HAVING TOTALS FOR UPDATE INDEX "
+    "CASE WHEN THEN ELSE END AND OR NOT IN IS NULL AS ALLOWED DISTINCT TOP HIERARCHY REFS BETWEEN LIKE ESCAPE INTO DROP "
+    "AUTOORDER ASC DESC OVERALL ONLY PERIODS TRUE FALSE UNDEFINED VALUE CAST TYPE VALUETYPE ISNULL PRESENTATION "
+    "REFPRESENTATION COUNT SUM MAX MIN AVG SUBSTRING").split()}
 
 
 class BuildError(Exception):
@@ -150,6 +188,8 @@ def scan(text):
         elif not exact and len(seg) >= 2 and "TabularSection" in token:
             r.member, r.member_name = "TabularSection", seg[1]
         out.append(r)
+        if r.member == "*" and len(seg) >= 4 and seg[1] == "StandardCommand" and seg[2] == "OpenByValue":
+            out.append(Ref(kind, seg[0], "StandardCommand", "OpenByValue"))
     return out
 
 
@@ -257,15 +297,28 @@ def object_element(text):
 
 # --- Files ----------------------------------------------------------------------
 
+def long_path(path):
+    """On Windows the \\\\?\\ form of a path, so that files past MAX_PATH (a deep
+    _files picture of a template below a temporary folder) open whatever the
+    LongPathsEnabled setting."""
+    if os.name != "nt" or path.startswith("\\\\?\\"):
+        return path
+    path = os.path.abspath(path)
+    return "\\\\?\\UNC\\" + path[2:] if path.startswith("\\\\") else "\\\\?\\" + path
+
+
 def read_file(path):
+    """A file that does not open is an error: an empty text would go into the CF
+    as a broken descriptor or picture."""
     try:
-        with open(path, "rb") as f:
+        with open(long_path(path), "rb") as f:
             return f.read().decode("utf-8", "surrogateescape")
-    except OSError:
-        return ""
+    except OSError as e:
+        raise BuildError("Не читается " + path + ": " + str(e.strerror or e))
 
 
 def write_file(path, text):
+    path = long_path(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(text.encode("utf-8", "surrogateescape"))
@@ -291,7 +344,7 @@ def descriptor_rel(key):
 
 
 def native(src, rel):
-    return os.path.join(src, *rel.split("/"))
+    return long_path(os.path.join(src, *rel.split("/")))
 
 
 def exists(src, key):
@@ -340,13 +393,14 @@ def stable_uuid(seed):
 # --- Stubs ----------------------------------------------------------------------
 
 class Stub:
-    __slots__ = ("reason", "members", "predefined", "based_on")
+    __slots__ = ("reason", "members", "predefined", "based_on", "by_value")
 
     def __init__(self):
         self.reason = ""          # the object that refers to it first
         self.members = set()      # (keyword, name); keyword * for a name of a data path
         self.predefined = False
         self.based_on = False     # its CreateBasedOn command is used: BasedOn stays non-empty
+        self.by_value = False     # an OpenByValue command is used: every master dimension stays
 
 
 def _indent_before(text, inner, inner_end):
@@ -354,17 +408,19 @@ def _indent_before(text, inner, inner_end):
     return text[nl:inner_end] if nl >= 0 and nl > inner else ""
 
 
-def clean_properties(text, props, self_key, keep_kind, present=frozenset(), based_on=False):
+def clean_properties(text, props, self_key, keep_kind, present=frozenset(), based_on=False, own=frozenset()):
     """A property referring to another object, or to a non-standard member of its own,
-    becomes empty; Name, Synonym, Comment, Type and the required ones stay. Of a list the
+    becomes empty, but the default form or the main schema the stub keeps (own); Name, Synonym, Comment, Type and the required ones stay. Of a list the
     items naming only objects of the CF stay."""
     kind = split_key(self_key)[0]
 
-    def foreign(part):
+    def foreign(part, tag):
         for r in scan(part):
             if keep_kind and r.kind == keep_kind:
                 continue
             if key_of(r.kind, r.name) == self_key and (not r.member or is_standard_member(r.member)) and not r.predefined:
+                continue
+            if key_of(r.kind, r.name) == self_key and tag in OPEN_PROPERTIES and (r.member, r.member_name) in own:
                 continue
             return True
         return False
@@ -374,7 +430,7 @@ def clean_properties(text, props, self_key, keep_kind, present=frozenset(), base
     for p in children(text, props.inner, props.inner_end):
         out.append(text[pos:p.open])
         keep_all = p.tag in ("Name", "Synonym", "Comment", "Type") or p.tag in REQUIRED_PROPERTIES.get(kind, ())
-        if keep_all or not foreign(text[p.inner:p.inner_end]):
+        if keep_all or not foreign(text[p.inner:p.inner_end], p.tag):
             out.append(text[p.open:p.end])
             pos = p.end
             continue
@@ -412,7 +468,7 @@ def stub_descriptor(text, key, stub, present, keep_below):
     for s in children(text, obj.inner, obj.inner_end):
         out.append(text[pos:s.open])
         if s.tag == "Properties":
-            out.append(clean_properties(text, s, key, "", present, stub.based_on))
+            out.append(clean_properties(text, s, key, "", present, stub.based_on, stub.members))
         elif s.tag == "ChildObjects":
             kept = ""
             last = s.inner
@@ -420,7 +476,9 @@ def stub_descriptor(text, key, stub, present, keep_below):
             names = [member_name(text, m) for m in kids]
 
             def wanted(i):
-                return (kids[i].tag, names[i]) in stub.members or ("*", names[i]) in stub.members
+                # /MergeCfg matches the OpenByValue commands by their order, so every master dimension stays
+                return ((kids[i].tag, names[i]) in stub.members or ("*", names[i]) in stub.members
+                        or (stub.by_value and kids[i].tag == "Dimension" and "<Master>true</Master>" in text[kids[i].open:kids[i].end]))
 
             required = REQUIRED_CHILDREN.get(split_key(key)[0], [])
             extra = len(kids)
@@ -505,17 +563,52 @@ def attribute_value(text, open_, close, name):
     return "" if to < 0 else text[frm:to]
 
 
-def query_refs(query):
+def query_refs(query, fields=None):
     """Sources of a dynamic list query (Справочник.Партнеры КАК П) and the fields read
-    through them (П.Менеджер.Имя): (object, path); a tabular section source starts the path."""
-    words = []  # dotted chains; strings, comments and parameters skipped
+    through them (П.Менеджер.Имя): (object, path); a tabular section source starts the path.
+    A field without an alias (ВЫБРАТЬ Сотрудник ИЗ …) is tried on every source of the
+    text, nested queries included: a member kept in excess is harmless, a missing one
+    fails the whole query in the import. fields, when given, gets the fields the text
+    names with КАК: their folded name → [(object, path)]."""
+    words = []  # (dotted chain, start, end); strings, comments and parameters skipped
     n = len(query)
+
+    def skip_string(i):
+        e = query.find('"', i + 1)
+        return n if e < 0 else e + 1
+
+    def skip_space(i):
+        while i < n:
+            if query[i] in SPACE:
+                i += 1
+            elif query.startswith("//", i):
+                e = query.find("\n", i)
+                i = n if e < 0 else e
+            else:
+                break
+        return i
+
+    def skip_parens(i):  # query[i] == "("; past the matching ")"
+        depth = 0
+        while i < n:
+            c = query[i]
+            if c == '"':
+                i = skip_string(i)
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return n
+
     i = 0
     while i < n:
         c = query[i]
         if c == '"':
-            e = query.find('"', i + 1)
-            i = n if e < 0 else e + 1
+            i = skip_string(i)
             continue
         if c == "/" and i + 1 < n and query[i + 1] == "/":
             e = query.find("\n", i)
@@ -540,31 +633,192 @@ def query_refs(query):
             else:
                 j = e
                 break
-        words.append(seg)
+        words.append((seg, i, j))
         i = j
+    at = {start: k for k, (_, start, _) in enumerate(words)}
 
     def kind_word(w):
-        if w in QUERY_KINDS:
-            return QUERY_KINDS[w]
-        return w if w in TYPE_FOLDERS and w != "Language" else ""
+        return QUERY_KINDS_FOLDED.get(fold(w), "")
 
-    out, alias = [], {}
-    for k, seg in enumerate(words):
+    def single(k):
+        return words[k][0][0] if k is not None and len(words[k][0]) == 1 else ""
+
+    out, alias, sources, seen, used = [], {}, [], set(), set()
+    ends = {end: k for k, (_, _, end) in enumerate(words)}
+    value_of = {}  # the word an expression starts at → (object, path) it yields
+    if fields is None:
+        fields = {}
+
+    def add(key, path):
+        if (key, tuple(path)) not in seen:
+            seen.add((key, tuple(path)))
+            out.append((key, path))
+
+    def named(k):
+        """The name after КАК that follows the word k, or ""."""
+        word = single(at.get(skip_space(words[k][2])))
+        if not word or fold(word) not in ("как", "as"):
+            return ""
+        return single(at.get(skip_space(words[at[skip_space(words[k][2])]][2])))
+
+    def name_field(name, key, path):
+        bound = fields.setdefault(fold(name), [])
+        if (key, path) not in bound:
+            bound.append((key, path))
+
+    def word_before(text):
+        b = len(text)
+        while b > 0 and is_ident(text[b - 1]):
+            b -= 1
+        return fold(text[b:])
+
+    # Names given with КАК: an alias may be a word of a kind (… КАК Задача); then a chain
+    # of that word is a source only after ИЗ or СОЕДИНЕНИЕ.
+    named_as = {fold(named(k)) for k in range(len(words)) if named(k)}
+    for k, (seg, start, end) in enumerate(words):
         kind = kind_word(seg[0]) if len(seg) >= 2 else ""
         if not kind:
             continue
+        before = query[:start].rstrip(SPACE)
+        used.add(k)
         key = key_of(kind, seg[1])
-        section = [seg[2]] if len(seg) >= 3 and seg[2] not in VIRTUAL_TABLES else []
-        out.append((key, section))
-        name = seg[-1]
-        if k + 2 < len(words) and len(words[k + 1]) == 1 and words[k + 1][0] in AS_WORDS:
-            name = words[k + 2][0]
-        alias[name] = (key, section)
-    for seg in words:
-        if len(seg) < 2 or seg[0] not in alias:
+        if before.endswith("(") and fold(before[:-1].rstrip(SPACE)[-8:]).endswith(("значение", "value")):
+            # ЗНАЧЕНИЕ(Справочник.Валюты.Рубль): a predefined item, an enum value is a member
+            add(key, [])
+            if len(seg) >= 3 and fold(seg[2]) not in ("пустаяссылка", "emptyref"):
+                add(key, [seg[2]] if kind == "Enum" else [PREDEFINED, seg[2]])
+            close = skip_space(end)
+            if close < n and query[close] == ")":  # ЗНАЧЕНИЕ(…) КАК Организация: a field of that type
+                word = single(at.get(skip_space(close + 1)))
+                if word and fold(word) in ("как", "as"):
+                    name = single(at.get(skip_space(words[at[skip_space(close + 1)]][2])))
+                    if name:
+                        name_field(name, key, [])
             continue
-        key, section = alias[seg[0]]
-        out.append((key, section + seg[1:]))
+        prev = word_before(before)
+        if not prev and before.endswith("("):
+            prev = "(" + word_before(before[:-1].rstrip(SPACE))
+        if prev in ("как", "as", "ссылка", "refs", "(тип", "(type"):
+            # A type, not a source: ВЫРАЗИТЬ(Д.Основание КАК Документ.Заказ).Склад,
+            # Т.Документ ССЫЛКА Документ.Заказ, ТИП(Документ.Заказ)
+            add(key, [])
+            close = skip_space(end)
+            if prev in ("как", "as") and close + 1 < n and query[close] == ")" and query[close + 1] == ".":
+                k2 = at.get(close + 2)
+                if k2 is not None:
+                    used.add(k2)
+                    add(key, list(words[k2][0]))
+                    if named(k2):
+                        name_field(named(k2), key, list(words[k2][0]))
+                    # the value of ВЫРАЗИТЬ(…).Склад, for ТОГДА ВЫРАЗИТЬ(…).Склад … КОНЕЦ КАК Склад
+                    depth, o = 0, close
+                    while o >= 0:
+                        depth += query[o] == ")"
+                        depth -= query[o] == "("
+                        if depth == 0:
+                            break
+                        o -= 1
+                    first = ends.get(query[:max(o, 0)].rstrip(SPACE).__len__())
+                    if first is not None:
+                        value_of[first] = [(key, list(words[k2][0]))]
+            continue
+        if fold(seg[0]) in named_as and prev not in ("из", "from", "соединение", "join"):
+            used.discard(k)  # a field through an alias named as a kind (Задача.Исполнитель)
+            continue
+        section = [seg[2]] if len(seg) >= 3 and seg[2] not in VIRTUAL_TABLES else []
+        if (key, section) not in sources:
+            sources.append((key, section))
+        add(key, section)
+        # The alias: past the parameters of a virtual table, after КАК or alone.
+        name = seg[-1]
+        pos = skip_space(end)
+        if pos < n and query[pos] == "(":
+            pos = skip_space(skip_parens(pos))
+        nxt = at.get(pos)
+        word = single(nxt)
+        if word and fold(word) in ("как", "as"):
+            following = single(at.get(skip_space(words[nxt][2])))
+            if following:
+                name = following
+        elif word and fold(word) not in QUERY_KEYWORDS:
+            name = word
+        bound = alias.setdefault(fold(name), [])  # the parts of ОБЪЕДИНИТЬ reuse an alias
+        if (key, section) not in bound:
+            bound.append((key, section))
+    for k, (seg, _, end) in enumerate(words):
+        if k in used:
+            continue
+        head = fold(seg[0])
+        if head in alias:
+            if len(seg) == 1 and query.startswith(".*", end):  # РегистрСведений.*: every field
+                paths = [(key, section + [ALL_FIELDS]) for key, section in alias[head] if not section]
+            else:
+                paths = [(key, section + seg[1:]) for key, section in alias[head]] if len(seg) >= 2 else []
+        elif len(seg) == 1 and head in QUERY_KEYWORDS:
+            continue
+        else:
+            # A field without an alias, or through the alias of a nested query or a temporary
+            # table (Вложенный.Ссылка.Поле): the chain and its tail are tried on every source,
+            # and a field named earlier with КАК goes on through what it was named after.
+            paths = [(key, section + seg) for key, section in sources]
+            if len(seg) >= 2:
+                paths += [(key, section + seg[1:]) for key, section in sources]
+            for at_seg in (0, 1):
+                if at_seg < len(seg) and (at_seg == 0 or len(seg) >= 2) and fold(seg[at_seg]) in fields:
+                    paths += [(key, path + seg[at_seg + 1:]) for key, path in list(fields[fold(seg[at_seg])])]
+        for key, path in paths:
+            add(key, path)
+        value_of[k] = paths
+        name = named(k)
+        if name:
+            for key, path in paths:
+                name_field(name, key, path)
+    # ВЫБОР КОГДА … ТОГДА Т.Склад ИНАЧЕ ВЫРАЗИТЬ(…).Склад КОНЕЦ КАК Склад: the field goes
+    # through the values of its branches.
+    cases = []
+    for k, (seg, _, _) in enumerate(words):
+        w = fold(seg[0]) if len(seg) == 1 else ""
+        if w in ("выбор", "case"):
+            cases.append([])
+        elif w in ("тогда", "иначе", "then", "else") and cases and k + 1 < len(words):
+            cases[-1] += value_of.get(k + 1, [])
+        elif w in ("конец", "end") and cases:
+            paths = cases.pop()
+            name = named(k)
+            if name:
+                for key, path in paths:
+                    name_field(name, key, path)
+    return out
+
+
+def module_values(text):
+    """ЗНАЧЕНИЕ(Перечисление.Статусы.ВРаботе) in the query texts of a module: the import checks
+    them, so the value or the predefined item must be in the CF. (object, path) as query_refs."""
+    out = []
+    n = len(text)
+    i = text.find("(")
+    while i >= 0:
+        b = i
+        while b > 0 and text[b - 1] in SPACE:
+            b -= 1
+        a = b
+        while a > 0 and is_ident(text[a - 1]):
+            a -= 1
+        if fold(text[a:b]) in ("значение", "value") and (a == 0 or text[a - 1] != "."):
+            j = i + 1
+            while j < n and text[j] in SPACE:
+                j += 1
+            e = j
+            while e < n and (is_ident(text[e]) or text[e] == "."):
+                e += 1
+            k = e
+            while k < n and text[k] in SPACE:
+                k += 1
+            if k < n and text[k] == ")" and text[j:e].count(".") == 2:
+                for r in query_refs("ЗНАЧЕНИЕ(" + text[j:e] + ")"):
+                    if r not in out:
+                        out.append(r)
+        i = text.find("(", i + 1)
     return out
 
 
@@ -600,12 +854,13 @@ def _dotted(t):
 
 def form_paths(form):
     """Data paths of a managed form from its attributes: (types, rest of the path).
-    Items.Таблица.CurrentData.Колонка goes through the DataPath of the item."""
+    Items.Таблица.CurrentData.Колонка goes through the DataPath of the item; a column
+    of a value table or tree attribute (Дерево.Вид.Единица) through the column's type."""
     out = []
     root = find(children(form, 0, len(form)), "Form")
     if not root:
         return out
-    attrs = {}
+    attrs, columns, list_fields = {}, {}, {}
     a = find(children(form, root.inner, root.inner_end), "Attributes")
     if a:
         for at in children(form, a.inner, a.inner_end):
@@ -615,6 +870,16 @@ def form_paths(form):
             t = find(kids, "Type")
             if t:
                 types.update(key_of(r.kind, r.name) for r in scan(form[t.inner:t.inner_end]))
+                if "cfg:ConstantsSet<" in form[t.inner:t.inner_end]:
+                    types.add(CONSTANTS_SET)
+            cols = find(kids, "Columns")
+            if cols and name:
+                for col in children(form, cols.inner, cols.inner_end):
+                    ct = find(children(form, col.inner, col.inner_end), "Type")
+                    col_types = {key_of(r.kind, r.name) for r in scan(form[ct.inner:ct.inner_end])} if ct else set()
+                    col_name = attribute_value(form, col.open, col.inner, "name")
+                    if col_name and col_types:
+                        columns[name + "." + col_name] = col_types
             settings = find(kids, "Settings")
             if settings:  # a dynamic list: its main table and query
                 opts = children(form, settings.inner, settings.inner_end)
@@ -623,7 +888,8 @@ def form_paths(form):
                     types.update(key_of(r.kind, r.name) for r in scan(form[main.inner:main.inner_end]))
                 q = find(opts, "QueryText")
                 if q:
-                    for key, path in query_refs(xml_text(form[q.inner:q.inner_end])):
+                    named = list_fields.setdefault(name, {}) if name else {}
+                    for key, path in query_refs(xml_text(form[q.inner:q.inner_end]), named):
                         out.append(({key}, path))
             if name and types:
                 attrs[name] = types
@@ -660,6 +926,11 @@ def form_paths(form):
         seg = t.split(".")
         if seg[0] == "Items" and len(seg) >= 4 and seg[2] == "CurrentData" and seg[1] in item_paths:
             seg = item_paths[seg[1]].split(".") + seg[3:]
+        if len(seg) >= 3 and seg[0] in list_fields:  # Список.Организация.ИНН: the field named in the query
+            for key, path in list_fields[seg[0]].get(fold(seg[1]), []):
+                out.append(({key}, path + seg[2:]))
+        if len(seg) >= 3 and seg[0] + "." + seg[1] in columns:
+            out.append((columns[seg[0] + "." + seg[1]], seg[2:]))
         if seg[0] not in attrs or len(seg) < 2:
             continue
         out.append((attrs[seg[0]], seg[1:]))
@@ -673,6 +944,7 @@ class Result:
         self.selected = []   # Catalog.X in the order given
         self.stubs = {}      # Catalog.Y → Stub
         self.subsystem = subsystem
+        self.configuration = ""  # the name of the root
         self.files = []      # written, relative to the output
 
 
@@ -680,9 +952,9 @@ def build(src, dst, objects, subsystem="_Перенос"):
     """Builds the reduced export in dst (absent or empty)."""
     res = Result(subsystem)
     _children_cache.clear()
-    if not os.path.isfile(os.path.join(src, "Configuration.xml")):
+    if not os.path.isfile(native(src, "Configuration.xml")):
         raise BuildError("Нет Configuration.xml в " + src)
-    if os.path.exists(dst) and os.listdir(dst):
+    if os.path.exists(long_path(dst)) and os.listdir(long_path(dst)):
         raise BuildError("Каталог результата не пуст: " + dst)
     chosen = set()
     for o in objects:
@@ -743,6 +1015,20 @@ def build(src, dst, objects, subsystem="_Перенос"):
         if r.member == "StandardCommand" and r.member_name == "CreateBasedOn" and not s.based_on:
             s.based_on = True
             mark(key)
+        if r.member == "StandardCommand" and r.member_name == "OpenByValue" and not s.by_value:
+            s.by_value = True
+            mark(key)
+        if r.member == "StandardCommand" and r.member_name == "Open" and r.kind in ("Report", "DataProcessor"):
+            # A stub opens by its default form or, a report, by its main schema.
+            text = descriptor(key)
+            obj = object_element(text)
+            props = find(children(text, obj.inner, obj.inner_end), "Properties") if obj else None
+            for tag in OPEN_PROPERTIES:
+                v = find(children(text, props.inner, props.inner_end), tag) if props else None
+                for o in scan(text[v.inner:v.inner_end]) if v else []:
+                    if key_of(o.kind, o.name) == key and o.member and (o.member, o.member_name) not in s.members:
+                        s.members.add((o.member, o.member_name))
+                        mark(key)
 
     descriptors = {}
 
@@ -772,31 +1058,199 @@ def build(src, dst, objects, subsystem="_Перенос"):
         obj = object_element(text)
         return type_keys(text, obj) if obj else set()
 
+    folder_names = {}
+
+    def canonical(key):
+        """The object as the export names it: the query language ignores case, and so
+        does the file system of Windows, so the folder is listed."""
+        kind, name = split_key(key)
+        folder = TYPE_FOLDERS.get(kind)
+        if not folder:
+            return key
+        names = folder_names.get(folder)
+        if names is None:
+            names = folder_names[folder] = {}
+            for e in _listing(native(src, folder)):
+                if e.name.endswith(".xml") and e.is_file():
+                    names.setdefault(fold(e.name[:-4]), e.name[:-4])
+        real = names.get(fold(name))
+        return key_of(kind, real) if real else key
+
+    common = None
+
+    def common_attribute(field, key):
+        """A common attribute named `field` that the object `key` has: its name, or ""."""
+        nonlocal common
+        if common is None:
+            common = {}
+            for e in _listing(native(src, "CommonAttributes")):
+                if not e.name.endswith(".xml"):
+                    continue
+                text = read_file(e.path)
+                obj = object_element(text)
+                props = find(children(text, obj.inner, obj.inner_end), "Properties") if obj else None
+                if not props:
+                    continue
+                parts = children(text, props.inner, props.inner_end)
+                auto = find(parts, "AutoUse")
+                uses = {}
+                content = find(parts, "Content")
+                for item in children(text, content.inner, content.inner_end) if content else []:
+                    kids = children(text, item.inner, item.inner_end)
+                    md, use = find(kids, "xr:Metadata"), find(kids, "xr:Use")
+                    if md and use:
+                        uses[text[md.inner:md.inner_end]] = text[use.inner:use.inner_end]
+                common.setdefault(fold(e.name[:-4]), (e.name[:-4], text[auto.inner:auto.inner_end] if auto else "", uses))
+        ca = common.get(fold(field))
+        if not ca:
+            return ""
+        use = ca[2].get(key, "Auto")
+        return ca[0] if use == "Use" or (use != "DontUse" and ca[1] == "Use") else ""
+
+    def find_member(mm, name):
+        """A member by name, the case of the query aside: (its name, Member) or (name, None)."""
+        m = mm.get(name)
+        if m is not None:
+            return name, m
+        f = fold(name)
+        for k in sorted(mm):
+            if fold(k) == f:
+                return k, mm[k]
+        return name, None
+
+    registrars = None
+
+    def registrars_of(key):
+        """The documents of the export whose RegisterRecords name the register."""
+        nonlocal registrars
+        if registrars is None:
+            registrars = {}
+            for e in _listing(native(src, "Documents")):
+                if not e.name.endswith(".xml") or not e.is_file():
+                    continue
+                text = read_file(e.path)
+                a, b = text.find("<RegisterRecords>"), text.find("</RegisterRecords>")
+                if a < 0 or b < 0:
+                    continue
+                for r in scan(text[a:b]):
+                    registrars.setdefault(key_of(r.kind, r.name), []).append(key_of("Document", e.name[:-4]))
+        return registrars.get(key, [])
+
+    def listed(key, tag):
+        """The objects a property of the descriptor names, in order: Owners, RegisteredDocuments, Content."""
+        text = descriptor(key)
+        obj = object_element(text)
+        props = find(children(text, obj.inner, obj.inner_end), "Properties") if obj else None
+        o = find(children(text, props.inner, props.inner_end), tag) if props else None
+        out = []
+        for r in scan(text[o.inner:o.inner_end]) if o else []:
+            if key_of(r.kind, r.name) not in out:
+                out.append(key_of(r.kind, r.name))
+        return out
+
+    def owners(key):
+        """The owners of a catalog: its Владелец goes to them."""
+        return set(listed(key, "Owners"))
+
+    def having(candidates, field):
+        """Of the objects a composite field may hold, those that have the next field: the ones
+        already in the CF, else the first; a standard field (Дата) needs none of them."""
+        with_it = [d for d in candidates if present_in_src(canonical(d)) and find_member(members(canonical(d)), field)[1] is not None]
+        return set([d for d in with_it if d in chosen or d in res.stubs] or with_it[:1])
+
+    def register_member(mm, field):
+        """A field of a virtual table (КоличествоОстаток, СчетДт): the member it is of, or (field, None)."""
+        f = fold(field)
+        tries = [f[:-2]] if f.endswith(tuple(fold(s) for s in SIDE_SUFFIXES)) else []
+        for t in [f] + tries:
+            for suffix in RESOURCE_SUFFIXES:
+                s = fold(suffix)
+                if t.endswith(s) and len(t) > len(s):
+                    tries.append(t[:-len(s)])
+                    break
+        for t in tries:
+            real, m = find_member(mm, field[:len(t)])
+            if m is not None:
+                return real, m
+        return field, None
+
     def walk(types, seg, i, owner, depth):
         """Объект.Счёт.Валюта: the stub of the account's type keeps Валюта, and so on down
-        the path; a tabular section is walked by its columns."""
+        the path; a tabular section is walked by its columns. Ссылка goes back to the
+        object, from a tabular section too (Т.Ссылка.Сотрудник); a field the object
+        does not have may be a resource of a virtual table, the recorder of a register
+        or a common attribute of it."""
         if i >= len(seg) or depth > 8:
             return
         for t0 in sorted(types):
+            if t0 == CONSTANTS_SET:  # НаборКонстант.Валюта.Код
+                ck = canonical(key_of("Constant", seg[i]))
+                if present_in_src(ck):
+                    note(Ref("Constant", split_key(ck)[1]), owner)
+                    walk(defined_types(ck), seg, i + 1, owner, depth + 1)
+                continue
             keys = {t0}
             if split_key(t0)[0] == "DefinedType" and present_in_src(t0):
                 keys = defined_types(t0)
             for key in sorted(keys):
+                key = canonical(key)
                 if not present_in_src(key):
                     continue
                 kind, name = split_key(key)
-                note(Ref(kind, name, "*", seg[i]), owner)
-                m = members(key).get(seg[i])
-                if m is None:
+                if seg[i] == ALL_FIELDS:
+                    if i == 0:
+                        for field in sorted(members(key)):
+                            note(Ref(kind, name, "*", field), owner)
+                    continue
+                if seg[i] == PREDEFINED:
+                    if i + 1 < len(seg):
+                        note(Ref(kind, name, "", "", seg[i + 1]), owner)
+                    continue
+                field, m = find_member(members(key), seg[i])
+                if m is None and kind in REGISTER_KINDS:
+                    field, m = register_member(members(key), field)
+                note(Ref(kind, name, "*", field), owner)
+                if m is None:  # a member of that name first: a register may have a dimension Ссылка
+                    if fold(field) in ("ссылка", "ref") and kind in ("DocumentJournal", "FilterCriterion"):
+                        # Журнал.Ссылка.Сотрудник: a document of the journal, an object of the criterion's content, that has it
+                        if i + 1 < len(seg):
+                            walk(having(listed(key, "RegisteredDocuments" if kind == "DocumentJournal" else "Content"),
+                                        seg[i + 1]), seg, i + 1, owner, depth + 1)
+                        continue
+                    if fold(field) in ("ссылка", "ref"):
+                        walk({key}, seg, i + 1, owner, depth + 1)
+                        continue
+                    if kind in ("Catalog", "ChartOfCharacteristicTypes") and fold(field) in ("владелец", "owner"):
+                        walk(owners(key), seg, i + 1, owner, depth + 1)  # Сертификат.Владелец.Номинал
+                        continue
+                    if kind in REGISTER_KINDS and fold(field) in ("регистратор", "recorder"):
+                        # Регистратор.Склад: a document writing the register that has Склад
+                        if i + 1 < len(seg):
+                            walk(having(registrars_of(key), seg[i + 1]), seg, i + 1, owner, depth + 1)
+                        continue
+                    ca = common_attribute(field, key)
+                    if ca:
+                        ca_key = key_of("CommonAttribute", ca)
+                        note(Ref("CommonAttribute", ca), owner)
+                        walk(defined_types(ca_key), seg, i + 1, owner, depth + 1)
                     continue
                 j = i + 1
                 while m is not None and m.tag == "TabularSection" and j < len(seg):
-                    m = m.columns.get(seg[j])
+                    column, c = find_member(m.columns, seg[j])
+                    if c is None and fold(column) in ("ссылка", "ref"):
+                        walk({key}, seg, j + 1, owner, depth + 1)
+                        m = None
+                        break
+                    m = c
                     j += 1
                 if m is not None and j < len(seg):
                     walk(m.types, seg, j, owner, depth + 1)
 
     def scan_file(path, owner):
+        if path.endswith(".bsl"):
+            for key, p in module_values(read_file(path)):
+                walk({key}, p, 0, owner, 0) if p else note(Ref(*split_key(canonical(key))), owner)
+            return
         if not path.endswith(".xml"):
             return
         text = read_file(path)
@@ -805,7 +1259,7 @@ def build(src, dst, objects, subsystem="_Перенос"):
         if os.path.basename(path) == "Form.xml":
             for types, rest in form_paths(text):
                 if not rest:
-                    for key in sorted(types):
+                    for key in sorted(canonical(t) for t in types):
                         kind, name = split_key(key)
                         note(Ref(kind, name), owner)
                 else:
@@ -847,8 +1301,6 @@ def build(src, dst, objects, subsystem="_Перенос"):
     # whose RegisterRecords names it, else the first such document of the export as a stub.
     # Lists of stubs keep the items naming objects of the CF, so every pass rebuilds all
     # stubs until nothing new comes.
-    registrars = None
-
     def needs_registrar(key):
         kind = split_key(key)[0]
         if kind in ("AccumulationRegister", "AccountingRegister", "CalculationRegister"):
@@ -864,18 +1316,7 @@ def build(src, dst, objects, subsystem="_Перенос"):
         for key in sorted(included()):
             if not needs_registrar(key):
                 continue  # a chosen register as well as a stub
-            if registrars is None:
-                registrars = {}
-                for e in _listing(os.path.join(src, "Documents")):
-                    if not e.name.endswith(".xml") or not e.is_file():
-                        continue
-                    text = read_file(e.path)
-                    a, b = text.find("<RegisterRecords>"), text.find("</RegisterRecords>")
-                    if a < 0 or b < 0:
-                        continue
-                    for r in scan(text[a:b]):
-                        registrars.setdefault(key_of(r.kind, r.name), []).append(key_of("Document", e.name[:-4]))
-            docs = registrars.get(key, [])
+            docs = registrars_of(key)
             if docs and not any(d in chosen or d in res.stubs for d in docs):
                 note(Ref("Document", split_key(docs[0])[1]), key)
 
@@ -898,10 +1339,11 @@ def build(src, dst, objects, subsystem="_Перенос"):
         for rel in files:
             copy(rel)
 
-    cfg = read_file(os.path.join(src, "Configuration.xml"))
+    cfg = read_file(native(src, "Configuration.xml"))
     obj = object_element(cfg)
     if not obj or obj.tag != "Configuration":
         raise BuildError("Configuration.xml: нет элемента Configuration.")
+    res.configuration = member_name(cfg, obj)
     kept = included()
     root = [cfg[:obj.inner]]
     pos = obj.inner
@@ -949,8 +1391,15 @@ def build(src, dst, objects, subsystem="_Перенос"):
 
 
 def merge_settings(res):
-    """/MergeCfg settings: the chosen objects from the file, the transfer subsystem not
-    merged; stubs are left out, which keeps them out of the base."""
+    """/MergeCfg settings: the chosen objects from the file; the root and the transfer
+    subsystem not merged, the stubs merged with the base first. Left out, the root is
+    merged all the same (8.3.27, unrelated configurations: the base lost its
+    Ext/ClientApplicationInterface.xml), and a stub overwrote its object in a reported
+    base (issue 1); with DoNotMerge the root still takes new objects. A stub with
+    DoNotMerge fails a large base: the owners, the types of a chart of characteristic
+    types or the chart of an accounting register naming another stub are "unresolvable
+    references"; merged with the base first, a stub changes nothing in it (a full dump
+    compared, 8.3.27)."""
     x = ["﻿<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
          "<Settings xmlns=\"http://v8.1c.ru/8.3/config/merge/settings\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" "
          "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" version=\"1.2\" platformVersion=\"8.3.11\">\r\n"
@@ -961,8 +1410,12 @@ def merge_settings(res):
         x.append("\t\t<Object fullNameInSecondConfiguration=\"" + escape(name) + "\">\r\n\t\t\t<MergeRule>" + rule +
                  "</MergeRule>\r\n\t\t</Object>\r\n")
 
+    if res.configuration:
+        obj("Configuration." + res.configuration, "DoNotMerge")
     for key in res.selected:
         obj(key, "GetFromSecondConfiguration")
+    for key in sorted(res.stubs):
+        obj(key, "MergePrioritizingMainConfiguration")
     obj("Subsystem." + res.subsystem, "DoNotMerge")
     return "".join(x) + "\t</Objects>\r\n</Settings>\r\n"
 
