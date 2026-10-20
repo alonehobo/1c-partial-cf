@@ -17,6 +17,7 @@ Python 3.8+, standard library only; Windows and Linux.
 """
 
 import argparse
+import difflib
 import heapq
 import json
 import os
@@ -86,6 +87,12 @@ REF_WORDS = {"Ссылка", "Ref"}
 PREDEFINED = "@predefined"  # a query path to a predefined item: [PREDEFINED, name]
 SPACE = " \t\r\n\x0b\x0c"  # the white space of a query, ASCII only as in the C++ builder
 OPEN_PROPERTIES = ("DefaultForm", "MainDataCompositionSchema")  # what StandardCommand.Open of a stub needs
+# Modules of a stub stay out of the CF: merged with the base first, a stub module still put
+# the methods of the export into the base module and added an end of line to a module
+# without one (8.3.27). A property of a stub that differs from the export gets DoNotMerge;
+# the Designer refuses a rule for a property equal in the base and the CF.
+STUB_MODULES = ("ObjectModule", "ManagerModule", "RecordSetModule", "ValueManagerModule", "CommandModule", "Module")
+KEPT_MODULES = ("/Ext/CommandModule.bsl", "/Ext/Form/Module.bsl")  # of a command or a form a stub keeps
 CONSTANTS_SET = "@constants"
 ALL_FIELDS = "@all"  # a query path Источник.*: every field of the object  # the type of a form attribute НаборКонстант: its fields are constants
 # A resource of a virtual table of a register (КоличествоОстаток, СуммаОборотДт): the suffix
@@ -322,6 +329,26 @@ def write_file(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(text.encode("utf-8", "surrogateescape"))
+
+
+def has_text(path):
+    """A module with something but white space in it; absent is empty."""
+    if not os.path.isfile(long_path(path)):
+        return False
+    return bool(read_file(path).lstrip("﻿").strip(" \t\r\n\x0b\x0c"))
+
+
+def content_of(text):
+    """The first Content element of a descriptor as written, '' without one."""
+    a = text.find("<Content")
+    while a >= 0 and text[a + 8:a + 9] not in (">", "/"):
+        a = text.find("<Content", a + 1)
+    if a < 0:
+        return ""
+    if text.startswith("<Content/>", a):
+        return "<Content/>"
+    e = text.find("</Content>", a)
+    return text[a:e + 10] if e >= 0 else ""
 
 
 def escape(s):
@@ -946,6 +973,8 @@ class Result:
         self.subsystem = subsystem
         self.configuration = ""  # the name of the root
         self.files = []      # written, relative to the output
+        self.rules = {}      # a stub or a child it keeps → its properties with DoNotMerge
+        self.patched = {}    # an object moved by module patches → its settings entries (patch_entries)
 
 
 def build(src, dst, objects, subsystem="_Перенос"):
@@ -1287,11 +1316,13 @@ def build(src, dst, objects, subsystem="_Перенос"):
             base = TYPE_FOLDERS[kind] + "/" + name + "/"
             files = []
             for rel in below(key):
+                if rel.endswith(KEPT_MODULES):
+                    continue
                 for k in keep:
                     if rel == base + k or (k.endswith("/") and rel.startswith(base + k)):
                         files.append(rel)
                         break
-            built[key] = (text, files)
+            built[key] = (text, files, keep)
             for r in scan(text):  # its own members too
                 note(r, key)
             for rel in files:
@@ -1334,10 +1365,22 @@ def build(src, dst, objects, subsystem="_Перенос"):
         for rel in below(key):
             copy(rel)
     for key in sorted(built):
-        text, files = built[key]
+        text, files, keep = built[key]
         put(descriptor_rel(key), text)
         for rel in files:
             copy(rel)
+        kind, name = split_key(key)
+        base = TYPE_FOLDERS[kind] + "/" + name + "/"
+        props = [m for m in STUB_MODULES if has_text(native(src, base + "Ext/" + m + ".bsl"))]
+        if kind == "FunctionalOption" and content_of(descriptor(key)) != content_of(text):
+            props.append("Content")
+        if props:
+            res.rules[key] = props
+        for k in keep:
+            if k.startswith("Commands/") and has_text(native(src, base + k + "Ext/CommandModule.bsl")):
+                res.rules[key + ".Command." + k[9:-1]] = ["CommandModule"]
+            elif k.startswith("Forms/") and k.endswith(".xml") and has_text(native(src, base + k[:-4] + "/Ext/Form/Module.bsl")):
+                res.rules[key + ".Form." + k[6:-4]] = ["Form"]
 
     cfg = read_file(native(src, "Configuration.xml"))
     obj = object_element(cfg)
@@ -1399,23 +1442,35 @@ def merge_settings(res):
     DoNotMerge fails a large base: the owners, the types of a chart of characteristic
     types or the chart of an accounting register naming another stub are "unresolvable
     references"; merged with the base first, a stub changes nothing in it (a full dump
-    compared, 8.3.27)."""
+    compared, 8.3.27) once its modules and the cut Content of a functional option are
+    not merged (res.rules): merged, they reordered the base's Content, added an end of
+    line to its module and the methods of the CF's command module to the base's."""
     x = ["﻿<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n"
          "<Settings xmlns=\"http://v8.1c.ru/8.3/config/merge/settings\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" "
          "xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" version=\"1.2\" platformVersion=\"8.3.11\">\r\n"
          "\t<Parameters>\r\n\t\t<ConfigurationsRelation>ConfigurationsNotRelated</ConfigurationsRelation>\r\n"
          "\t\t<AllowMainConfigurationObjectDeletion>false</AllowMainConfigurationObjectDeletion>\r\n\t</Parameters>\r\n\t<Objects>\r\n"]
 
-    def obj(name, rule):
-        x.append("\t\t<Object fullNameInSecondConfiguration=\"" + escape(name) + "\">\r\n\t\t\t<MergeRule>" + rule +
-                 "</MergeRule>\r\n\t\t</Object>\r\n")
+    def obj(name, rule, props=()):
+        x.append("\t\t<Object fullNameInSecondConfiguration=\"" + escape(name) + "\">\r\n\t\t\t<MergeRule>" + rule + "</MergeRule>\r\n")
+        if props:
+            x.append("\t\t\t<Properties>\r\n")
+            for p in props:
+                x.append("\t\t\t\t<Property name=\"" + p + "\">\r\n\t\t\t\t\t<MergeRule>DoNotMerge</MergeRule>\r\n\t\t\t\t</Property>\r\n")
+            x.append("\t\t\t</Properties>\r\n")
+        x.append("\t\t</Object>\r\n")
 
     if res.configuration:
         obj("Configuration." + res.configuration, "DoNotMerge")
     for key in res.selected:
-        obj(key, "GetFromSecondConfiguration")
+        if key in res.patched:
+            x.extend(res.patched[key])
+        else:
+            obj(key, "GetFromSecondConfiguration")
     for key in sorted(res.stubs):
-        obj(key, "MergePrioritizingMainConfiguration")
+        obj(key, "MergePrioritizingMainConfiguration", res.rules.get(key, ()))
+    for key in sorted(k for k in res.rules if k not in res.stubs):  # a command or a form a stub keeps
+        obj(key, "MergePrioritizingMainConfiguration", res.rules[key])
     obj("Subsystem." + res.subsystem, "DoNotMerge")
     return "".join(x) + "\t</Objects>\r\n</Settings>\r\n"
 
@@ -1491,22 +1546,284 @@ def objects_of_changes(changes, exists_rel):
     return objects, root, deleted
 
 
-def git_changes(export, since):
-    def git(*args):
-        p = subprocess.run(["git", "-C", export, "-c", "core.quotepath=off", *args], capture_output=True)
-        return p.returncode, p.stdout.decode("utf-8", "surrogateescape"), p.stderr.decode("utf-8", "replace")
+def git(export, *args):
+    p = subprocess.run(["git", "-C", export, "-c", "core.quotepath=off", *args], capture_output=True)
+    return p.returncode, p.stdout.decode("utf-8", "surrogateescape"), p.stderr.decode("utf-8", "replace")
 
-    code, _, _ = git("rev-parse", "--verify", "--quiet", since + "^{commit}")
-    if code != 0:
-        raise BuildError("Ревизия git '" + since + "' не найдена в " + export + ".")
-    code, diff, err = git("diff", "--name-status", "--relative", since, "--", ".")
+
+def git_changed_files(export, since, until=""):
+    """[(added|modified|deleted, path)] from since to until, or to the working tree with
+    the untracked files when until is empty."""
+    for rev in (since, until):
+        if rev and git(export, "rev-parse", "--verify", "--quiet", rev + "^{commit}")[0] != 0:
+            raise BuildError("Ревизия git '" + rev + "' не найдена в " + export + ".")
+    code, diff, err = git(export, "diff", "--name-status", "--relative", since, *([until] if until else []), "--", ".")
     if code != 0:
         raise BuildError("git diff: " + err.strip()[:1000])
     lines = diff.splitlines()
-    code, untracked, _ = git("ls-files", "--others", "--exclude-standard")
-    if code == 0:
-        lines += ["A\t" + u for u in untracked.splitlines() if u]
-    return objects_of_changes(parse_name_status(lines), lambda rel: os.path.isfile(native(export, rel)))
+    if not until:
+        code, untracked, _ = git(export, "ls-files", "--others", "--exclude-standard")
+        if code == 0:
+            lines += ["A\t" + u for u in untracked.splitlines() if u]
+    return parse_name_status(lines)
+
+
+def git_changes(export, since, until=""):
+    changes = git_changed_files(export, since, until)
+    exists_rel = (lambda rel: git(export, "cat-file", "-e", until + ":./" + rel)[0] == 0) if until else \
+        (lambda rel: os.path.isfile(native(export, rel)))
+    return objects_of_changes(changes, exists_rel)
+
+
+# --- Module patches -------------------------------------------------------------------
+
+MODULE_PROPS = ("ObjectModule", "ManagerModule", "RecordSetModule", "ValueManagerModule", "CommandModule", "Module")
+METHOD_START = re.compile(r"[ \t]*(?:(?:Асинх|Async)[ \t]+)?(?:Процедура|Функция|Procedure|Function)[ \t]+([^\s(]+)[ \t]*\(", re.I)
+METHOD_END = re.compile(r"[ \t]*(?:КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)(?![\wА-Яа-яЁё])", re.I)
+
+
+def module_of(rel):
+    """A module file of the export → (object, settings name, property); None for another file.
+    Catalogs/X/Ext/ObjectModule.bsl → (Catalog.X, Catalog.X, ObjectModule); a form module →
+    (Catalog.X, Catalog.X.Form.F, Form); a command module → (Catalog.X, Catalog.X.Command.C,
+    CommandModule). The property names are those of the /MergeCfg settings (8.3.27)."""
+    p = rel.replace("\\", "/").split("/")
+    kind = {f: k for k, f in TYPE_FOLDERS.items()}.get(p[0])
+    if not kind or kind == "Language" or len(p) < 4:
+        return None
+    key = key_of(kind, p[1])
+    if len(p) == 4 and p[2] == "Ext" and p[3].endswith(".bsl") and p[3][:-4] in MODULE_PROPS:
+        return key, key, p[3][:-4]
+    if kind == "CommonForm" and p[2:] == ["Ext", "Form", "Module.bsl"]:
+        return key, key, "Form"
+    if len(p) == 7 and p[2] == "Forms" and p[4:] == ["Ext", "Form", "Module.bsl"]:
+        return key, key + ".Form." + p[3], "Form"
+    if len(p) == 6 and p[2] == "Commands" and p[4:] == ["Ext", "CommandModule.bsl"]:
+        return key, key + ".Command." + p[3], "CommandModule"
+    return None
+
+
+def parse_method(spec):
+    """CommonModule.М.Метод, Document.Д.ObjectModule.Метод, Document.Д.Form.Ф.Метод,
+    Document.Д.Command.К.Метод, CommonForm.Ф.Метод, CommonCommand.К.Метод →
+    (settings name, property, method)."""
+    p = spec.split(".")
+    if len(p) >= 3 and p[0] in TYPE_FOLDERS and all(p):
+        key = key_of(p[0], p[1])
+        common = {"CommonModule": "Module", "CommonForm": "Form", "CommonCommand": "CommandModule"}
+        if len(p) == 3 and p[0] in common:
+            return key, common[p[0]], p[2]
+        if len(p) == 4 and p[2] in MODULE_PROPS:
+            return key, p[2], p[3]
+        if len(p) == 5 and p[2] in ("Form", "Command"):
+            return key + "." + p[2] + "." + p[3], "Form" if p[2] == "Form" else "CommandModule", p[4]
+    raise BuildError(spec + ": ожидается CommonModule.Модуль.Метод, Document.Документ.ObjectModule.Метод, "
+                     "Document.Документ.Form.Форма.Метод и т. п.")
+
+
+def module_text(text):
+    """A module as compared and patched: no BOM, LF line ends."""
+    return (text or "").lstrip("﻿").replace("\r\n", "\n")
+
+
+def method_owners(lines):
+    """For every line of a module the method it belongs to — its header, body and the
+    comments and compile directives right above it — None outside methods."""
+    owner = [None] * len(lines)
+    i = 0
+    while i < len(lines):
+        m = METHOD_START.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and not METHOD_END.match(lines[j]):
+            j += 1
+        a = i
+        while a > 0 and owner[a - 1] is None and lines[a - 1].lstrip().startswith(("//", "&")):
+            a -= 1
+        for k in range(a, min(j, len(lines) - 1) + 1):
+            owner[k] = m.group(1).lower()
+        i = j + 1
+    return owner
+
+
+def keep_methods(target, merged, names):
+    """target with the changes of merged inside the methods names (lower case) only →
+    (text, the other methods changed, '' for a change outside methods)."""
+    a, b = target.split("\n"), merged.split("\n")
+    oa, ob = method_owners(a), method_owners(b)
+    out, skipped = [], set()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            out += a[i1:i2]
+            continue
+        # an empty line between methods goes with the change it is part of
+        owners = {o or "" for line, o in zip(a[i1:i2] + b[j1:j2], oa[i1:i2] + ob[j1:j2]) if line.strip()}
+        if owners and owners <= names:
+            out += b[j1:j2]
+        else:
+            out += a[i1:i2]
+            skipped |= owners - names
+    return "\n".join(out), sorted(skipped)
+
+
+def unified_patch(a, b):
+    """The unidiff /MergeCfg applies to the base module (LF; the Designer refuses a hunk whose
+    context differs, CRLF in a patch doubles the line ends)."""
+    out = []
+    for line in difflib.unified_diff(a.splitlines(True), b.splitlines(True), "a/Module", "b/Module"):
+        out.append(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n")
+    return "".join(out)
+
+
+def merge3(ours, base, theirs, tmp):
+    """git merge-file: the changes from base to theirs put onto ours → (text, conflicts)."""
+    paths = []
+    for n, t in (("ours", ours), ("base", base), ("theirs", theirs)):
+        p = os.path.join(tmp, "merge-" + n)
+        with open(p, "wb") as f:
+            f.write(t.encode("utf-8", "surrogateescape"))
+        paths.append(p)
+    r = subprocess.run(["git", "merge-file", "-p", "-L", "база", "-L", "было", "-L", "задача"] + paths, capture_output=True)
+    if r.returncode < 0 or r.returncode > 127:
+        raise BuildError("git merge-file: " + r.stderr.decode("utf-8", "replace").strip()[:500])
+    return r.stdout.decode("utf-8", "surrogateescape"), r.returncode
+
+
+class Patch:
+    __slots__ = ("rel", "entry", "prop", "base", "text")
+
+    def __init__(self, rel, entry, prop, base, text):
+        self.rel, self.entry, self.prop, self.base, self.text = rel, entry, prop, base, text
+
+
+def plan_patches(export, since, until, target, changes, methods, tmp, report):
+    """The objects changed in modules only → {object: [Patch]}; the rest goes whole.
+
+    The task's change of a module is since → until (the working tree without until). The
+    patch is made on the module of the base: the target export's when given (the change
+    merged onto it with git merge-file; a conflict stops the build), else the module as at
+    since. With methods only the changes inside those methods go."""
+    chosen = {}
+    for spec in methods:
+        entry, prop, name = parse_method(spec)
+        chosen.setdefault((entry, prop), set()).add(name.lower())
+    by_object = {}
+    for status, path in changes:
+        owner = owner_xml(path)
+        slash = owner.find("/")
+        kind = {f: k for k, f in TYPE_FOLDERS.items()}.get(owner[:slash]) if slash > 0 else None
+        if kind and kind != "Language":
+            by_object.setdefault(key_of(kind, owner[slash + 1:-4]), []).append((status, path))
+    patches, whole, unchanged, conflicts, skipped = {}, [], [], [], []
+    for key in sorted(by_object):
+        files = by_object[key]
+        other = [p for s, p in files if module_of(p) is None or s == "deleted"]
+        if other:
+            whole.append({"object": key, "reason": "изменён не только модуль: " + other[0]})
+            continue
+        for status, rel in files:
+            _, entry, prop = module_of(rel)
+            names = chosen.get((entry, prop))
+            if methods and names is None:
+                skipped.append({"module": rel, "reason": "методы модуля не выбраны"})
+                continue
+            old = module_text(git(export, "show", since + ":./" + rel)[1]) if status != "added" else ""
+            new = module_text(git(export, "show", until + ":./" + rel)[1] if until else read_file(native(export, rel)))
+            base = module_text(read_file(native(target, rel))) if target and os.path.isfile(native(target, rel)) else \
+                ("" if target else old)
+            merged, n = (new, 0) if base == old else merge3(base, old, new, tmp)
+            if n:
+                conflicts.append({"module": rel, "conflicts": n, "text": merged})
+                continue
+            if names is not None:
+                merged, other_methods = keep_methods(base, merged, names)
+                if other_methods:
+                    skipped.append({"module": rel, "reason": "изменения вне выбранных методов не переносятся",
+                                    "methods": [m or "(вне методов)" for m in other_methods]})
+            if merged == base:
+                unchanged.append(rel)
+                continue
+            patches.setdefault(key, []).append(Patch(rel, entry, prop, base, merged))
+    for (entry, prop), names in sorted(chosen.items()):
+        if not any(p.entry == entry and p.prop == prop for ps in patches.values() for p in ps):
+            skipped.append({"module": entry + "." + prop, "reason": "нет изменений в выбранных методах"})
+    for k, v in (("patched_whole", whole), ("patch_unchanged", unchanged), ("patch_skipped", skipped)):
+        if v:
+            report[k] = v
+    return patches, [w["object"] for w in whole], conflicts
+
+
+def apply_patches(res, dst, target, export, since, patches):
+    """The CF and the settings of the objects moved by patches. Merged with the base first
+    (8.3.27): a patched module gets its Patch; a module of the object not patched stays out
+    of the CF and gets DoNotMerge when the base has it, else the base takes its methods;
+    the forms, commands and templates not patched are not merged; a patched form keeps the
+    base's elements, only its module patched."""
+    for key, plist in patches.items():
+        kind, name = split_key(key)
+        base_dir = TYPE_FOLDERS[kind] + "/" + name + "/"
+
+        def base_has(rel):
+            if target:
+                return has_text(native(target, rel))
+            code, text, _ = git(export, "show", since + ":./" + rel)
+            return code == 0 and bool(module_text(text).strip(" \t\r\n\x0b\x0c"))
+
+        own = {}
+        for rel in list(res.files):
+            m = module_of(rel)
+            if m and m[0] == key and m[1] == key:
+                own[m[2]] = rel
+        patched = {(p.entry, p.prop): p for p in plist}
+        for p in plist:
+            write_file(native(dst, p.rel), "﻿" + p.text.replace("\n", "\r\n"))
+            if p.rel not in res.files:
+                res.files.append(p.rel)
+
+        def patch_xml(p, indent):
+            return indent + "<Module>\r\n" + indent + "\t<Patch>" + escape(unified_patch(p.base, p.text)) + "</Patch>\r\n" + indent + "</Module>\r\n"
+
+        x = ["\t\t<Object fullNameInSecondConfiguration=\"" + escape(key) + "\">\r\n\t\t\t<MergeRule>MergePrioritizingMainConfiguration</MergeRule>\r\n"]
+        props = []
+        for prop in MODULE_PROPS + ("Form",):
+            p = patched.get((key, prop))
+            if p is not None:
+                body = patch_xml(p, "\t\t\t\t\t")
+                if prop == "Form":
+                    body = ("\t\t\t\t\t<FormModule>\r\n\t\t\t\t\t\t<MergeRule>MergePrioritizingSecondConfiguration</MergeRule>\r\n"
+                            + patch_xml(p, "\t\t\t\t\t\t") + "\t\t\t\t\t</FormModule>\r\n")
+                props.append("\t\t\t\t<Property name=\"" + prop + "\">\r\n" + body + "\t\t\t\t</Property>\r\n")
+            elif prop in own:
+                rel = own[prop]
+                os.remove(native(dst, rel))
+                res.files.remove(rel)
+                if base_has(rel):
+                    props.append("\t\t\t\t<Property name=\"" + prop + "\">\r\n\t\t\t\t\t<MergeRule>DoNotMerge</MergeRule>\r\n\t\t\t\t</Property>\r\n")
+        if props:
+            x += ["\t\t\t<Properties>\r\n"] + props + ["\t\t\t</Properties>\r\n"]
+        x.append("\t\t</Object>\r\n")
+        children = set()
+        for rel in res.files:
+            if rel.startswith(base_dir):
+                part = rel[len(base_dir):].split("/")
+                if len(part) >= 2 and part[0] in ("Forms", "Commands", "Templates"):
+                    child = part[1][:-4] if part[1].endswith(".xml") and len(part) == 2 else part[1]
+                    children.add(({"Forms": "Form", "Commands": "Command", "Templates": "Template"}[part[0]], child))
+        for tag, child in sorted(children):
+            entry = key + "." + tag + "." + child
+            p = patched.get((entry, "Form" if tag == "Form" else "CommandModule"))
+            if p is None:
+                x.append("\t\t<Object fullNameInSecondConfiguration=\"" + escape(entry) + "\">\r\n\t\t\t<MergeRule>DoNotMerge</MergeRule>\r\n\t\t</Object>\r\n")
+                continue
+            body = patch_xml(p, "\t\t\t\t\t")
+            if tag == "Form":
+                body = ("\t\t\t\t\t<FormModule>\r\n\t\t\t\t\t\t<MergeRule>MergePrioritizingSecondConfiguration</MergeRule>\r\n"
+                        + patch_xml(p, "\t\t\t\t\t\t") + "\t\t\t\t\t</FormModule>\r\n")
+            x.append("\t\t<Object fullNameInSecondConfiguration=\"" + escape(entry) + "\">\r\n\t\t\t<MergeRule>MergePrioritizingMainConfiguration</MergeRule>\r\n"
+                     "\t\t\t<Properties>\r\n\t\t\t\t<Property name=\"" + p.prop + "\">\r\n" + body + "\t\t\t\t</Property>\r\n\t\t\t</Properties>\r\n\t\t</Object>\r\n")
+        res.patched[key] = x
 
 
 # --- ibcmd ----------------------------------------------------------------------
@@ -1545,6 +1862,13 @@ def main(argv=None):
     ap.add_argument("--out", help="файл CF; рядом пишется <имя>.merge-settings.xml")
     ap.add_argument("--objects", nargs="*", default=[], help="Вид.Имя верхнего уровня: Document.Заказ Catalog.Товары")
     ap.add_argument("--since", default="", help="ревизия git выгрузки: изменённые с неё и новые объекты")
+    ap.add_argument("--until", default="", help="конец изменений задачи (ревизия git); без него — рабочее дерево")
+    ap.add_argument("--patch", action="store_true",
+                    help="объекты, у которых изменены только модули, переносить патчами модулей, а не целиком")
+    ap.add_argument("--target", default="", help="выгрузка базы-получателя: патчи строятся на её модулях")
+    ap.add_argument("--methods", nargs="*", default=[],
+                    help="переносить изменения только этих методов: CommonModule.М.Метод, Document.Д.ObjectModule.Метод, "
+                         "Document.Д.Form.Ф.Метод")
     ap.add_argument("--platform", default="", help="версия платформы для поиска ibcmd, например 8.3.27")
     ap.add_argument("--ibcmd", default="", help="путь к ibcmd")
     ap.add_argument("--source-only", default="", help="только урезанная выгрузка в этот каталог, без ibcmd")
@@ -1569,6 +1893,17 @@ def main(argv=None):
     if not objects and not a.since:
         report["error"] = "Укажите --objects и/или --since."
         return finish(2)
+    methods = [m for item in a.methods for m in re.split(r"[,\s]+", item) if m]
+    patch_mode = a.patch or bool(methods)
+    if (patch_mode or a.until or a.target) and not a.since:
+        report["error"] = "--patch, --methods, --until и --target работают вместе с --since."
+        return finish(2)
+    target = os.path.abspath(a.target) if a.target else ""
+    if target and os.path.basename(target).lower() == "configuration.xml":
+        target = os.path.dirname(target)
+    if target and not os.path.isdir(target):
+        report["error"] = "Нет каталога выгрузки базы " + target + "."
+        return finish(2)
     ibcmd = ""
     if not a.source_only:
         ibcmd = a.ibcmd or find_ibcmd(a.platform)
@@ -1577,24 +1912,43 @@ def main(argv=None):
             return finish(2)
     tmp = tempfile.mkdtemp(prefix="partial-cf-")
     try:
+        out_cf = os.path.abspath(a.out) if a.out else ""
+        settings = a.settings or (os.path.splitext(out_cf)[0] + ".merge-settings.xml" if out_cf else
+                                  os.path.join(os.path.dirname(os.path.abspath(a.source_only)),
+                                               os.path.basename(os.path.abspath(a.source_only)) + ".merge-settings.xml"))
+        stem = settings[:-len(".merge-settings.xml")] if settings.endswith(".merge-settings.xml") else settings
+        patches = {}
         if a.since:
-            changed, root, deleted = git_changes(export, a.since)
+            changes = git_changed_files(export, a.since, a.until)
+            changed, root, deleted = git_changes(export, a.since, a.until)
             report["changed"] = changed
             if root:
                 report["root_changed"] = root
             if deleted:
                 report["deleted"] = deleted
+            if patch_mode:
+                explicit = set(objects)
+                patches, whole, conflicts = plan_patches(export, a.since, a.until, target, changes, methods, tmp, report)
+                if conflicts:
+                    folder = stem + ".conflicts"
+                    for c in conflicts:
+                        write_file(native(folder, c["module"]), "﻿" + c.pop("text").replace("\n", "\r\n"))
+                    report.update({"error": "Изменения задачи пересекаются с правками базы: разрешите конфликты вручную.",
+                                   "conflicts": conflicts, "conflicts_folder": folder})
+                    return finish(1)
+                for key in explicit:
+                    patches.pop(key, None)
+                changed = [o for o in changed if o in patches or o in whole]
             objects += [o for o in changed if o not in objects]
         if not objects:
             report["error"] = "Нет изменённых объектов с " + a.since + "."
             return finish(1)
-        out_cf = os.path.abspath(a.out) if a.out else ""
-        settings = a.settings or (os.path.splitext(out_cf)[0] + ".merge-settings.xml" if out_cf else
-                                  os.path.join(os.path.dirname(os.path.abspath(a.source_only)),
-                                               os.path.basename(os.path.abspath(a.source_only)) + ".merge-settings.xml"))
         source = os.path.abspath(a.source_only) if a.source_only else os.path.join(tmp, "src")
         started = time.time()
         res = build(export, source, objects)
+        apply_patches(res, source, target, export, a.since, patches)
+        if patches:
+            report["patched"] = [{"object": k, "modules": [p.rel for p in v]} for k, v in sorted(patches.items())]
         write_file(settings, merge_settings(res))
         # Hundreds of stubs do not fit an answer: counts by kind, the first ones and the whole list in a file.
         stubs = [{"object": k, "referred_by": res.stubs[k].reason} for k in sorted(res.stubs)]
