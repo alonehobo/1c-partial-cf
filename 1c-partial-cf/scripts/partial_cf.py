@@ -1596,9 +1596,16 @@ def main(argv=None):
         started = time.time()
         res = build(export, source, objects)
         write_file(settings, merge_settings(res))
+        # Hundreds of stubs do not fit an answer: counts by kind, the first ones and the whole list in a file.
+        stubs = [{"object": k, "referred_by": res.stubs[k].reason} for k in sorted(res.stubs)]
+        stubs_file = (settings[:-len(".merge-settings.xml")] if settings.endswith(".merge-settings.xml") else settings) + ".stubs.json"
+        write_file(stubs_file, json.dumps(stubs, ensure_ascii=False, indent=1))
+        kinds = {}
+        for k in sorted(res.stubs):
+            kinds[k.split(".")[0]] = kinds.get(k.split(".")[0], 0) + 1
         report.update({
-            "selected": res.selected, "stubs_total": len(res.stubs),
-            "stubs": [{"object": k, "referred_by": res.stubs[k].reason} for k in sorted(res.stubs)],
+            "selected": res.selected, "stubs_total": len(res.stubs), "stubs_by_kind": kinds,
+            "stubs": stubs[:30], "stubs_file": stubs_file,
             "files": len(res.files), "subsystem": res.subsystem, "merge_settings": settings,
             "build_seconds": round(time.time() - started, 1),
         })
