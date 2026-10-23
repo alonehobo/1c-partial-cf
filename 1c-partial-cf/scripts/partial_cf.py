@@ -975,6 +975,21 @@ class Result:
         self.files = []      # written, relative to the output
         self.rules = {}      # a stub or a child it keeps → its properties with DoNotMerge
         self.patched = {}    # an object moved by module patches → its settings entries (patch_entries)
+        self.code_mismatch = []  # objects without a code whose predefined items have one (predefined_code_mismatch)
+
+
+def predefined_codes(descriptor_text, predefined_text):
+    """Predefined items with a code in an object without a code (CodeLength 0): a load of
+    XML erases these codes, a base loaded from the vendor's CF keeps them, and /MergeCfg
+    then refuses with unresolved references to the object (issue 3 of 1c-partial-cf).
+    The names of such items; [""] when the codes are there but the names are not found."""
+    if not re.search(r"<CodeLength>\s*0\s*</CodeLength>", descriptor_text):
+        return []
+    codes = re.findall(r"<Code(?:\s[^>]*)?>\s*[^<\s][^<]*</Code>", predefined_text)
+    if not codes:
+        return []
+    names = re.findall(r"<Name>([^<]*)</Name>\s*<Code(?:\s[^>]*)?>\s*[^<\s][^<]*</Code>", predefined_text)
+    return names or [""]
 
 
 def build(src, dst, objects, subsystem="_Перенос"):
@@ -1381,6 +1396,15 @@ def build(src, dst, objects, subsystem="_Перенос"):
                 res.rules[key + ".Command." + k[9:-1]] = ["CommandModule"]
             elif k.startswith("Forms/") and k.endswith(".xml") and has_text(native(src, base + k[:-4] + "/Ext/Form/Module.bsl")):
                 res.rules[key + ".Form." + k[6:-4]] = ["Form"]
+
+    for key in sorted(included()):
+        kind, name = split_key(key)
+        rel = TYPE_FOLDERS[kind] + "/" + name + "/Ext/Predefined.xml"
+        if rel in below(key):
+            items = predefined_codes(descriptor(key), read_file(native(src, rel)))
+            if items:
+                res.code_mismatch.append({"object": key, "in_cf": "whole" if key in chosen else "stub",
+                                          "items": [i for i in items if i]})
 
     cfg = read_file(native(src, "Configuration.xml"))
     obj = object_element(cfg)
@@ -1963,6 +1987,13 @@ def main(argv=None):
             "files": len(res.files), "subsystem": res.subsystem, "merge_settings": settings,
             "build_seconds": round(time.time() - started, 1),
         })
+        if res.code_mismatch:
+            report["predefined_code_mismatch"] = res.code_mismatch
+            report["predefined_code_hint"] = (
+                "У объекта нет кода (CodeLength=0), а у предопределённых элементов код записан. Загрузка XML код сотрёт, "
+                "и если в базе-получателе он есть, /MergeCfg откажет с «Неразрешимые ссылки на объект …». "
+                "До объединения уберите код у этих предопределённых элементов в базе-получателе — например, "
+                "частичной загрузкой в неё XML этих объектов из её же выгрузки (загрузка XML код сотрёт).")
         if a.source_only:
             report.update({"ok": True, "source": source})
             return finish(0)
