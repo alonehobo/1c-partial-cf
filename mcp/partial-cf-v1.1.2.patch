@@ -1,0 +1,65 @@
+--- a/packages/1c-form-viewer/native/partial-cf.h
++++ b/packages/1c-form-viewer/native/partial-cf.h
+@@ -24,6 +24,7 @@
+ #include <cstring>
+ #include <fstream>
+ #include <functional>
++#include <regex>
+ #include <sstream>
+ 
+ namespace partial_cf {
+@@ -257,7 +258,7 @@
+ 
+ /* Predefined items with a code in an object without a code (CodeLength 0): a load of
+  * XML erases these codes, a base loaded from the vendor's CF keeps them, and /MergeCfg
+- * then refuses with unresolved references to the object (issue 3 of 1c-partial-cf).
++ * can refuse if support locks the object in the target (issue 3 of 1c-partial-cf).
+  * The names of such items; { "" } when the codes are there but the names are not found. */
+ inline std::vector<std::string> PredefinedCodes(const std::string& descriptor, const std::string& predefined)
+ {
+@@ -268,6 +269,11 @@
+     at = skip(descriptor, at + 12);
+     if (at >= descriptor.size() || descriptor[at] != '0') return {};
+     if (descriptor.compare(skip(descriptor, at + 1), 13, "</CodeLength>") != 0) return {};
++    static const std::regex numericType(R"(<CodeType>\s*Number\s*</CodeType>)");
++    static const std::regex explicitType(R"((?:^|\s)xsi:type\s*=\s*(['"])([^'"]*)\1)");
++    static const std::regex decimalType(R"(\s*xs:decimal\s*)");
++    static const std::regex numericZero(R"([+-]?(?:0+(?:\.0*)?|\.0+))");
++    const bool numeric = std::regex_search(descriptor, numericType);
+     std::vector<std::string> names;
+     bool coded = false;
+     for (size_t pos = predefined.find("<Code"); pos != std::string::npos; pos = predefined.find("<Code", pos + 5)) {
+@@ -277,7 +283,14 @@
+         if ((after != '>' && !space(after)) || predefined[end - 1] == '/') continue;   // <CodeLength>, <Code/>
+         size_t value = skip(predefined, end + 1);
+         size_t close = predefined.find('<', end + 1);
+-        if (value >= close || predefined.compare(close, 7, "</Code>") != 0) continue;
++        if (close == std::string::npos || value >= close || predefined.compare(close, 7, "</Code>") != 0) continue;
++        const auto attrs = predefined.substr(pos + 5, end - pos - 5);
++        std::smatch type;
++        const bool isNumber = std::regex_search(attrs, type, explicitType) ?
++            std::regex_match(type[2].str(), decimalType) : numeric;
++        size_t valueEnd = close;
++        while (valueEnd > value && space(predefined[valueEnd - 1])) valueEnd--;
++        if (isNumber && std::regex_match(predefined.substr(value, valueEnd - value), numericZero)) continue;
+         coded = true;
+         size_t nameEnd = predefined.rfind("</Name>", pos);
+         if (nameEnd == std::string::npos || skip(predefined, nameEnd + 7) != pos) continue;
+--- a/packages/1c-form-viewer/native/workbench-jobs.h
++++ b/packages/1c-form-viewer/native/workbench-jobs.h
+@@ -724,9 +724,12 @@
+   for(const auto& m:r.codeMismatch){auto items=workbench::array();for(const auto& i:m.items)items.array.push_back(str(i));
+    list.array.push_back(Json::objectValue({{"object",str(m.object)},{"in_cf",str(m.whole?"whole":"stub")},{"items",items}}));}
+   report.object["predefined_code_mismatch"]=list;
+-  report.object["predefined_code_hint"]=str("These objects have no code (CodeLength=0) but their predefined items carry one. Loading XML erases the code, so if the base "
+-   "keeps it, /MergeCfg refuses with «Неразрешимые ссылки на объект …». Before merging remove the code of these predefined items in the base, "
+-   "e.g. by a partial load of these objects' XML from the base's own export.");
++  report.object["predefined_code_hint"]=str("These objects have no code (CodeLength=0) but their predefined items carry one. Loading XML erases the code; "
++   "/MergeCfg may refuse with «Неразрешимые ссылки на объект …» if support locks the object in the target base. Check support in the target: "
++   "a locked object requires allowing edits while retaining support. In the cases reported in issue #3 this alone allowed the merge without removing the code first. "
++   "If edits are already allowed and you want to remove the code in advance, partially load only the object descriptor and its Ext/Predefined.xml "
++   "from the target's own export; with ibcmd exclude forms, which may remain locked. A locked object also forbids this partial XML load. "
++   "The builder does not check the target's support rules.");
+  }
+  report.object["subsystem"]=str(r.subsystem);report.object["merge_settings"]=str(utf8_from_wide(settings.wstring()));
+  report.object["hint"]=str("Stubs carry only the uuid and what the chosen objects refer to: in «Сравнить, объединить» mark by the subsystem "+r.subsystem+

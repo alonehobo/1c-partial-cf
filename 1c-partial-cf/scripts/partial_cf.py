@@ -981,15 +981,25 @@ class Result:
 def predefined_codes(descriptor_text, predefined_text):
     """Predefined items with a code in an object without a code (CodeLength 0): a load of
     XML erases these codes, a base loaded from the vendor's CF keeps them, and /MergeCfg
-    then refuses with unresolved references to the object (issue 3 of 1c-partial-cf).
+    can refuse if support locks the object in the target (issue 3 of 1c-partial-cf).
     The names of such items; [""] when the codes are there but the names are not found."""
     if not re.search(r"<CodeLength>\s*0\s*</CodeLength>", descriptor_text):
         return []
-    codes = re.findall(r"<Code(?:\s[^>]*)?>\s*[^<\s][^<]*</Code>", predefined_text)
-    if not codes:
-        return []
-    names = re.findall(r"<Name>([^<]*)</Name>\s*<Code(?:\s[^>]*)?>\s*[^<\s][^<]*</Code>", predefined_text)
-    return names or [""]
+    numeric = bool(re.search(r"<CodeType>\s*Number\s*</CodeType>", descriptor_text))
+    names, coded = [], False
+    for code in re.finditer(r"(?:<Name>([^<]*)</Name>\s*)?<Code(\s[^>]*)?>([^<]*)</Code>", predefined_text):
+        value = code[3].strip()
+        if not value:
+            continue
+        code_type = re.search(r"(?:^|\s)xsi:type\s*=\s*(['\"])([^'\"]*)\1", code[2] or "")
+        # An explicit string type wins over CodeType; the string "0" is a code.
+        is_number = code_type[2].strip() == "xs:decimal" if code_type else numeric
+        if is_number and re.fullmatch(r"[+-]?(?:0+(?:\.0*)?|\.0+)", value):
+            continue
+        coded = True
+        if code[1] is not None:
+            names.append(code[1])
+    return (names or [""]) if coded else []
 
 
 def build(src, dst, objects, subsystem="_Перенос"):
@@ -1991,9 +2001,12 @@ def main(argv=None):
             report["predefined_code_mismatch"] = res.code_mismatch
             report["predefined_code_hint"] = (
                 "У объекта нет кода (CodeLength=0), а у предопределённых элементов код записан. Загрузка XML код сотрёт, "
-                "и если в базе-получателе он есть, /MergeCfg откажет с «Неразрешимые ссылки на объект …». "
-                "До объединения уберите код у этих предопределённых элементов в базе-получателе — например, "
-                "частичной загрузкой в неё XML этих объектов из её же выгрузки (загрузка XML код сотрёт).")
+                "и /MergeCfg может отказать с «Неразрешимые ссылки на объект …», если объект в базе-получателе на замке поддержки. "
+                "Проверьте правило поддержки именно в получателе: для объекта на замке требуется разрешить редактирование с сохранением поддержки; "
+                "в случаях из отчёта issue #3 этого было достаточно без предварительного удаления кода. "
+                "Если правка уже разрешена и нужно убрать код заранее, загрузите из выгрузки получателя частично только описание объекта "
+                "и его Ext/Predefined.xml; через ibcmd — без форм, которые могут оставаться на замке. "
+                "Для объекта на замке такая загрузка XML тоже запрещена. Правило поддержки получателя сборщик не проверяет.")
         if a.source_only:
             report.update({"ok": True, "source": source})
             return finish(0)
