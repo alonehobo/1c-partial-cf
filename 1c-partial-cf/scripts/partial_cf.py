@@ -166,7 +166,7 @@ _ID = "0-9A-Za-z_\u0080-\U0010ffff"
 # A run of identifier characters that starts a word (not after another one or a dot):
 # after "style:" a style item, else one starting with A-Z and followed by a dot.
 _CANDIDATE = re.compile("(?<![." + _ID + "])(?:(?<=style:)([" + _ID + "]+)|([A-Z][" + _ID + "]*)(?=\\.))")
-_SEGMENTS = re.compile("(?:\\.[" + _ID + "]+){1,5}")
+_SEGMENTS = re.compile("(?:\\.[" + _ID + "]+){1,15}")  # 15: a subsystem nested seven deep
 
 
 def scan(text):
@@ -184,7 +184,12 @@ def scan(text):
             continue
         seg = chain.group(0)[1:].split(".")
         r = Ref(kind, seg[0])
-        if exact and len(seg) >= 3 and seg[1] in MEMBER_KEYWORDS:
+        if exact and kind == "Subsystem" and len(seg) >= 3 and seg[1] == "Subsystem":
+            n = 3  # a nested subsystem: Subsystem.A.Subsystem.B.Subsystem.C
+            while n + 1 < len(seg) and seg[n] == "Subsystem":
+                n += 2
+            r.name = ".".join(seg[:n])
+        elif exact and len(seg) >= 3 and seg[1] in MEMBER_KEYWORDS:
             r.member, r.member_name = seg[1], seg[2]
         elif exact and len(seg) >= 4 and seg[1] == "StandardCommand" and seg[2] == "OpenByValue":
             r.member, r.member_name = "*", seg[3]
@@ -364,10 +369,24 @@ def split_key(key):
     return (key, "") if dot < 0 else (key[:dot], key[dot + 1:])
 
 
-def descriptor_rel(key):
+NESTED = ".Subsystem."  # Subsystem.Продажи.Subsystem.Розница: a nested subsystem
+
+
+def object_dir(key):
+    """Kinds/X of an object, '' for an unknown kind; a nested subsystem lies below its
+    parent: Subsystems/Продажи/Subsystems/Розница."""
     kind, name = split_key(key)
     folder = TYPE_FOLDERS.get(kind)
-    return folder + "/" + name + ".xml" if folder else ""
+    if not folder:
+        return ""
+    if kind == "Subsystem":
+        return folder + "/" + name.replace(NESTED, "/" + folder + "/")
+    return folder + "/" + name
+
+
+def descriptor_rel(key):
+    d = object_dir(key)
+    return d + ".xml" if d else ""
 
 
 def native(src, rel):
@@ -390,9 +409,8 @@ def _listing(path):
 def files_below(src, key):
     """Kinds/X.xml and every file below Kinds/X, relative to the export, '/'. The files
     below go by name: the order decides who a stub names as its referrer."""
-    kind, name = split_key(key)
-    folder = TYPE_FOLDERS.get(kind)
-    if not folder or not os.path.isfile(native(src, folder + "/" + name + ".xml")):
+    d = object_dir(key)
+    if not d or not os.path.isfile(native(src, d + ".xml")):
         return []
     below = []
 
@@ -403,8 +421,8 @@ def files_below(src, key):
             elif e.is_file():
                 below.append(rel + e.name)
 
-    walk(native(src, folder + "/" + name), folder + "/" + name + "/")
-    return [folder + "/" + name + ".xml"] + sorted(below)
+    walk(native(src, d), d + "/")
+    return [d + ".xml"] + sorted(below)
 
 
 def stable_uuid(seed):
@@ -545,6 +563,85 @@ def stub_descriptor(text, key, stub, present, keep_below):
         keep_below.append("Ext/Predefined.xml")
     out.append(text[pos:])
     return "".join(out)
+
+
+def narrow_types(text, allowed, emptied=None):
+    """Every <Type> keeps only the types naming objects of allowed (and primitive ones);
+    left without a type it becomes Boolean (emptied[0] = True). A stub keeps the uuid and
+    generated types of its object, not what its types name: a defined type, a chart of
+    characteristic types or an attribute of a document named dozens of objects each, as
+    stubs in turn (ERP: 156 of 382 stubs of one document), and a locked catalog among them
+    stopped /MergeCfg with «Неразрешимые ссылки на объект … ПВХ.СтатьиРасходов.Тип»."""
+    out = []
+    pos = 0
+    at = text.find("<Type>")
+    while at != -1:
+        close = text.find("</Type>", at)
+        if close == -1:
+            break
+        out.append(text[pos:at + 6])
+        inner = at + 6
+        kept = ""
+        last = inner
+        removed = typed = False
+        for item in children(text, inner, close):
+            gap, body = text[last:item.open], text[item.open:item.end]
+            last = item.end
+            if item.tag in ("v8:Type", "v8:TypeSet"):
+                if any(key_of(r.kind, r.name) not in allowed for r in scan(body)):
+                    removed = True
+                    continue
+                typed = True
+            kept += gap + body
+        if not removed:
+            out.append(text[inner:close])
+        elif typed:
+            out.append(kept + text[last:close])
+        else:
+            if emptied is not None:
+                emptied[0] = True
+            first = text[inner:close]
+            lt, indent = first.find("<"), first.rfind("\n")
+            out.append((first[:lt] if lt != -1 else "") + "<v8:Type>xs:boolean</v8:Type>" + (first[indent:] if indent != -1 else ""))
+        pos = close
+        at = text.find("<Type>", pos)
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def narrow_stub(text, key, allowed, emptied):
+    """narrow_types over a stub, its object and each member it keeps; emptied gets the owner
+    (Catalog.X, Catalog.X.Attribute.Y) of a type left with no item. Merged with the base
+    first, a stub left the base's types as they were (ERP: every file of 217 stubs equal
+    before and after /MergeCfg), except the Type of the object itself: /MergeCfg unites it
+    with the base's, adding the Boolean to a chart of characteristic types, so that Type
+    gets DoNotMerge."""
+    edits = []
+
+    def walk(el, owner):
+        for part in children(text, el.inner, el.inner_end):
+            if part.tag == "Properties":
+                t = find(children(text, part.inner, part.inner_end), "Type")
+                if not t:
+                    continue
+                before = text[t.open:t.end]
+                empty = [False]
+                after = narrow_types(before, allowed, empty)
+                if after != before:
+                    edits.append((t.open, t.end, after))
+                if empty[0]:
+                    emptied.append(owner)
+            elif part.tag == "ChildObjects":
+                for m in children(text, part.inner, part.inner_end):
+                    walk(m, owner + "." + m.tag + "." + member_name(text, m))
+
+    obj = object_element(text)
+    if not obj:
+        return text
+    walk(obj, key)
+    for frm, to, new in reversed(edits):
+        text = text[:frm] + new + text[to:]
+    return text
 
 
 # --- Data paths of forms -----------------------------------------------------------
@@ -1055,6 +1152,12 @@ def build(src, dst, objects, subsystem="_Перенос"):
         key = key_of(r.kind, r.name)
         if key in chosen or r.kind == "Language" or not present_in_src(key):
             return
+        if r.kind == "Subsystem" and NESTED in r.name:
+            # A nested subsystem: its parent, a stub too, keeps it among its subsystems.
+            parent, child = r.name.rsplit(NESTED, 1)
+            if key_of("Subsystem", parent.split(".")[0]) in chosen:
+                return  # the chosen parent brings it whole
+            note(Ref("Subsystem", parent, "Subsystem", child), owner)
         s = res.stubs.get(key)
         if s is None:
             s = res.stubs[key] = Stub()
@@ -1336,9 +1439,10 @@ def build(src, dst, objects, subsystem="_Перенос"):
             if len(present) != len(chosen) + len(res.stubs):
                 present = included()
             keep = []
-            text = stub_descriptor(descriptor(key), key, res.stubs[key], present, keep)
-            kind, name = split_key(key)
-            base = TYPE_FOLDERS[kind] + "/" + name + "/"
+            # Its types name only what the CF holds anyway: no stub comes from a type of a stub.
+            emptied = []
+            text = narrow_stub(stub_descriptor(descriptor(key), key, res.stubs[key], present, keep), key, present, emptied)
+            base = object_dir(key) + "/"
             files = []
             for rel in below(key):
                 if rel.endswith(KEPT_MODULES):
@@ -1347,7 +1451,7 @@ def build(src, dst, objects, subsystem="_Перенос"):
                     if rel == base + k or (k.endswith("/") and rel.startswith(base + k)):
                         files.append(rel)
                         break
-            built[key] = (text, files, keep)
+            built[key] = (text, files, keep, emptied)
             for r in scan(text):  # its own members too
                 note(r, key)
             for rel in files:
@@ -1390,15 +1494,18 @@ def build(src, dst, objects, subsystem="_Перенос"):
         for rel in below(key):
             copy(rel)
     for key in sorted(built):
-        text, files, keep = built[key]
+        text, files, keep, emptied = built[key]
         put(descriptor_rel(key), text)
         for rel in files:
             copy(rel)
-        kind, name = split_key(key)
-        base = TYPE_FOLDERS[kind] + "/" + name + "/"
+        kind = split_key(key)[0]
+        base = object_dir(key) + "/"
         props = [m for m in STUB_MODULES if has_text(native(src, base + "Ext/" + m + ".bsl"))]
         if kind == "FunctionalOption" and content_of(descriptor(key)) != content_of(text):
             props.append("Content")
+        # A member's emptied type is left alone: merged first with the base, its type stayed (ERP).
+        if key in emptied:
+            props.append("Type")
         if props:
             res.rules[key] = props
         for k in keep:
@@ -1408,8 +1515,7 @@ def build(src, dst, objects, subsystem="_Перенос"):
                 res.rules[key + ".Form." + k[6:-4]] = ["Form"]
 
     for key in sorted(included()):
-        kind, name = split_key(key)
-        rel = TYPE_FOLDERS[kind] + "/" + name + "/Ext/Predefined.xml"
+        rel = object_dir(key) + "/Ext/Predefined.xml"
         if rel in below(key):
             items = predefined_codes(descriptor(key), read_file(native(src, rel)))
             if items:
@@ -1891,7 +1997,7 @@ def run_ibcmd(ibcmd, args, timeout):
 # --- Command line ----------------------------------------------------------------------
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Маленькая CF из выгрузки конфигурации 1С для «Сравнить, объединить».")
+    ap = argparse.ArgumentParser(description="Мини CF из выгрузки конфигурации 1С для «Сравнить, объединить».")
     ap.add_argument("--export", required=True, help="каталог выгрузки (или его Configuration.xml)")
     ap.add_argument("--out", help="файл CF; рядом пишется <имя>.merge-settings.xml")
     ap.add_argument("--objects", nargs="*", default=[], help="Вид.Имя верхнего уровня: Document.Заказ Catalog.Товары")

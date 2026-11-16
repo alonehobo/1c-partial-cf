@@ -1,0 +1,111 @@
+--- a/packages/1c-form-viewer/native/partial-cf.h
++++ b/packages/1c-form-viewer/native/partial-cf.h
+@@ -96,7 +96,7 @@ inline std::vector<Ref> Scan(const std::string& text)
+         if (kind.empty()) { i = j; continue; }
+         std::vector<std::string> seg;
+         size_t k = j;
+-        while (k < n && text[k] == '.' && seg.size() < 5) {
++        while (k < n && text[k] == '.' && seg.size() < 15) {   // 15: a subsystem nested seven deep
+             size_t e = ident(k + 1);
+             if (e == k + 1) break;
+             seg.push_back(text.substr(k + 1, e - k - 1));
+@@ -104,7 +104,12 @@ inline std::vector<Ref> Scan(const std::string& text)
+         }
+         if (seg.empty()) { i = j; continue; }
+         Ref r{ kind, seg[0] };
+-        if (exact && seg.size() >= 3 && MemberKeywords().count(seg[1])) { r.member = seg[1]; r.memberName = seg[2]; }
++        if (exact && kind == "Subsystem" && seg.size() >= 3 && seg[1] == "Subsystem") {
++            size_t m = 3;   // a nested subsystem: Subsystem.A.Subsystem.B.Subsystem.C
++            while (m + 1 < seg.size() && seg[m] == "Subsystem") m += 2;
++            for (size_t q = 1; q < m; q++) r.name += "." + seg[q];
++        }
++        else if (exact && seg.size() >= 3 && MemberKeywords().count(seg[1])) { r.member = seg[1]; r.memberName = seg[2]; }
+         else if (exact && seg.size() >= 4 && seg[1] == "StandardCommand" && seg[2] == "OpenByValue") { r.member = "*"; r.memberName = seg[3]; }
+         else if (exact && seg.size() >= 3 && seg[1] == "StandardCommand") { r.member = seg[1]; r.memberName = seg[2]; }
+         else if (exact && seg.size() == 2 && !IsStandardMember(seg[1]) && !MemberKeywords().count(seg[1]) && seg[1] != "EmptyRef") r.predefined = seg[1];
+@@ -333,11 +338,24 @@ inline std::pair<std::string, std::string> SplitKey(const std::string& key)
+     return { key.substr(0, dot), dot == std::string::npos ? std::string() : key.substr(dot + 1) };
+ }
+ 
+-inline std::string DescriptorRel(const std::string& key)
++inline const std::string kNested = ".Subsystem.";   // Subsystem.Продажи.Subsystem.Розница: a nested subsystem
++
++/* Kinds/X of an object, empty for an unknown kind; a nested subsystem lies below its
++ * parent: Subsystems/Продажи/Subsystems/Розница. */
++inline std::string ObjectDir(const std::string& key)
+ {
+     auto [kind, name] = SplitKey(key);
+     auto f = Folders().find(kind);
+-    return f == Folders().end() ? std::string() : f->second + "/" + name + ".xml";
++    if (f == Folders().end()) return std::string();
++    if (kind == "Subsystem")
++        for (size_t at; (at = name.find(kNested)) != std::string::npos;) name.replace(at, kNested.size(), "/" + f->second + "/");
++    return f->second + "/" + name;
++}
++
++inline std::string DescriptorRel(const std::string& key)
++{
++    std::string d = ObjectDir(key);
++    return d.empty() ? d : d + ".xml";
+ }
+ 
+ /* A uuid stable for the configuration and the subsystem name, so a rebuilt CF
+@@ -622,7 +640,11 @@ inline std::vector<std::string> FilesBelow(const fs::path& src, const std::strin
+ {
+     std::vector<std::string> out;
+     std::wstring error;
+-    std::wstring wkey = U8(key).wstring();
++    // A nested subsystem as Subsystem.Продажи\Subsystems\Розница: the folder below its parent.
++    std::string path = key;
++    if (SplitKey(key).first == "Subsystem")
++        for (size_t at; (at = path.find(kNested)) != std::string::npos;) path.replace(at, kNested.size(), "\\Subsystems\\");
++    std::wstring wkey = U8(path).wstring();
+     for (const auto& f : infobase_ops::ObjectFiles(src.wstring(), wkey, error)) {
+         std::string rel = fs::path(f).u8string();
+         std::replace(rel.begin(), rel.end(), '\\', '/');
+@@ -1188,9 +1210,17 @@ inline Result Build(const fs::path& src, const fs::path& dst, const std::vector<
+     };
+     std::set<std::string> dirty;
+     /* A reference found in `owner`'s text: a stub or a member of one. */
+-    auto note = [&](const Ref& r, const std::string& owner) {
++    std::function<void(const Ref&, const std::string&)> note;
++    note = [&](const Ref& r, const std::string& owner) {
+         std::string key = Key(r.kind, r.name);
+         if (chosen.count(key) || r.kind == "Language" || !Exists(src, key)) return;
++        size_t nested = r.kind == "Subsystem" ? r.name.rfind(kNested) : std::string::npos;
++        if (nested != std::string::npos) {
++            // A nested subsystem: its parent, a stub too, keeps it among its subsystems.
++            std::string parent = r.name.substr(0, nested);
++            if (chosen.count(Key("Subsystem", parent.substr(0, parent.find('.'))))) return;   // the chosen parent brings it whole
++            note(Ref{ "Subsystem", parent, "Subsystem", r.name.substr(nested + kNested.size()) }, owner);
++        }
+         bool fresh = !res.stubs.count(key);
+         Stub& s = res.stubs[key];
+         if (fresh) { s.reason = owner; dirty.insert(key); }
+@@ -1480,7 +1510,7 @@ inline Result Build(const fs::path& src, const fs::path& dst, const std::vector<
+         std::string text = NarrowStub(StubDescriptor(descriptor(key), key, res.stubs[key], present, keep), key, present, emptied);
+         std::vector<std::string> files;
+         auto [kind, name] = SplitKey(key);
+-        std::string base = Folders().at(kind) + "/" + name + "/";
++        std::string base = ObjectDir(key) + "/";
+         for (const auto& rel : FilesBelow(src, key)) {
+             if (IsKeptModule(rel)) continue;
+             for (const auto& k : keep)
+@@ -1526,7 +1556,7 @@ inline Result Build(const fs::path& src, const fs::path& dst, const std::vector<
+         put(DescriptorRel(key), b.text);
+         for (const auto& rel : b.files) copy(rel);
+         auto [kind, name] = SplitKey(key);
+-        std::string base = Folders().at(kind) + "/" + name + "/";
++        std::string base = ObjectDir(key) + "/";
+         std::vector<std::string> props;
+         for (const auto& m : StubModules()) if (HasText(src / U8(base + "Ext/" + m + ".bsl"))) props.push_back(m);
+         if (kind == "FunctionalOption" && ContentOf(descriptor(key)) != ContentOf(b.text)) props.push_back("Content");
+@@ -1545,7 +1575,7 @@ inline Result Build(const fs::path& src, const fs::path& dst, const std::vector<
+     for (const auto& key : included()) {
+         if (options.shells && chosen.count(key)) continue;   // a shell carries no predefined items
+         auto [kind, name] = SplitKey(key);
+-        std::string rel = Folders().at(kind) + "/" + name + "/Ext/Predefined.xml";
++        std::string rel = ObjectDir(key) + "/Ext/Predefined.xml";
+         const auto files = FilesBelow(src, key);
+         if (std::find(files.begin(), files.end(), rel) == files.end()) continue;
+         auto items = PredefinedCodes(descriptor(key), ReadFile(src / U8(rel)));
