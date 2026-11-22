@@ -1147,7 +1147,7 @@ def build(src, dst, objects, subsystem="_Перенос"):
             v = exists_cache[key] = exists(src, key)
         return v
 
-    def note(r, owner):
+    def note(r, owner, from_predefined=False):
         """A reference found in owner's text: a stub or a member of one."""
         key = key_of(r.kind, r.name)
         if key in chosen or r.kind == "Language" or not present_in_src(key):
@@ -1166,7 +1166,9 @@ def build(src, dst, objects, subsystem="_Перенос"):
         if r.member and not is_standard_member(r.member) and (r.member, r.member_name) not in s.members:
             s.members.add((r.member, r.member_name))
             mark(key)
-        if r.predefined and not s.predefined:
+        # MergeCfg resolves types in predefined items against the referenced stubs' predefined data.
+        if not s.predefined and (r.predefined or (
+                from_predefined and r.kind in ("Catalog", "ChartOfCharacteristicTypes", "ChartOfAccounts", "ChartOfCalculationTypes"))):
             s.predefined = True
             mark(key)
         if r.member == "StandardCommand" and r.member_name == "CreateBasedOn" and not s.based_on:
@@ -1411,8 +1413,9 @@ def build(src, dst, objects, subsystem="_Перенос"):
         if not path.endswith(".xml"):
             return
         text = read_file(path)
+        from_predefined = path == native(src, object_dir(owner) + "/Ext/Predefined.xml")
         for r in scan(text):
-            note(r, owner)
+            note(r, owner, from_predefined)
         if os.path.basename(path) == "Form.xml":
             for types, rest in form_paths(text):
                 if not rest:
